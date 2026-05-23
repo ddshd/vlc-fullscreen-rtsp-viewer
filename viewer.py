@@ -56,6 +56,20 @@ if IS_WINDOWS:
     HOOKPROC      = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
     WNDPROCTYPE   = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style",           wintypes.UINT),
+            ("lpfnWndProc",     WNDPROCTYPE),
+            ("cbClsExtra",      ctypes.c_int),
+            ("cbWndExtra",      ctypes.c_int),
+            ("hInstance",       wintypes.HINSTANCE),
+            ("hIcon",           wintypes.HICON),
+            ("hCursor",         wintypes.HANDLE),
+            ("hbrBackground",   wintypes.HBRUSH),
+            ("lpszMenuName",    wintypes.LPCWSTR),
+            ("lpszClassName",   wintypes.LPCWSTR),
+        ]
+
 # ── macOS-only imports ────────────────────────────────────────────────────────
 if IS_MAC:
     try:
@@ -164,11 +178,8 @@ def run_mac():
     ]
     instance = vlc.Instance(*vlc_args)
     player   = instance.media_player_new()
-
-    # Give VLC the NSView pointer as an integer
     player.set_nsobject(objc.pyobjc_id(content_view))
 
-    # ── State & threads ───────────────────────────────────────────────────
     running      = threading.Event()
     running.set()
     restart_lock = threading.Lock()
@@ -182,7 +193,7 @@ def run_mac():
         media.add_option(":network-caching={}".format(CACHE_MS))
         media.add_option(":live-caching={}".format(CACHE_MS))
         media.add_option(":no-audio")
-        media.add_option(":rtsp-udp")        # UDP: drop frames, don't stall
+        media.add_option(":rtsp-udp")
         player.set_media(media)
         player.play()
 
@@ -202,7 +213,6 @@ def run_mac():
         while running.is_set():
             time.sleep(2)
             state = player.get_state()
-            # Hard error / stop states
             if state in (
                 vlc.State.Ended,
                 vlc.State.Error,
@@ -215,7 +225,6 @@ def run_mac():
                 last_time  = -1
                 last_check = time.monotonic()
                 continue
-            # UDP stall detection: playback clock frozen = stream dropped
             current_time = player.get_time()
             now          = time.monotonic()
             if current_time != last_time:
@@ -227,11 +236,8 @@ def run_mac():
                     restart_stream()
 
     threading.Thread(target=watch_loop, daemon=True).start()
-
-    # Start playing
     start_stream()
 
-    # Run the Cocoa event loop (handles window, keyboard, etc.)
     from AppKit import NSDate, NSRunLoop, NSDefaultRunLoopMode
     loop = NSRunLoop.currentRunLoop()
     while running.is_set():
@@ -397,7 +403,7 @@ class WindowsViewer:
         # The Surface Windows button is registered by the shell as a hotkey
         # and delivered via WM_HOTKEY — it never reaches the keyboard hook.
         # We create a message-only window, register the hotkey, and handle it.
-        wc                  = ctypes.wintypes.WNDCLASSW()
+        wc                  = WNDCLASSW()
         wc.lpfnWndProc      = WNDPROCTYPE(self._wnd_proc)
         wc.hInstance        = hMod
         wc.lpszClassName    = "RTSPViewerMsg"
