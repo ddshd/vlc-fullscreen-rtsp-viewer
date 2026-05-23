@@ -20,20 +20,13 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    WH_KEYBOARD_LL  = 13
-    WH_MOUSE_LL     = 14
-    WM_KEYDOWN      = 0x0100
-    WM_SYSKEYDOWN   = 0x0104
-    WM_KEYUP        = 0x0101
-    WM_SYSKEYUP     = 0x0105
+    WH_KEYBOARD_LL   = 13
+    WH_MOUSE_LL      = 14
+    WM_KEYDOWN       = 0x0100
+    WM_SYSKEYDOWN    = 0x0104
     WM_LBUTTONDBLCLK = 0x0203
-    WM_HOTKEY       = 0x0312
-    VK_LWIN         = 0x5B
-    VK_RWIN         = 0x5C
-
-    # Surface tablet Windows button comes through as a registered hotkey
-    # with these IDs from the tablet input service
-    SURFACE_WIN_HOTKEY_ID = 0x0001
+    VK_VOLUME_UP     = 0xAF
+    VK_VOLUME_DOWN   = 0xAE
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -53,22 +46,7 @@ if IS_WINDOWS:
             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
-    HOOKPROC      = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-    WNDPROCTYPE   = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-
-    class WNDCLASSW(ctypes.Structure):
-        _fields_ = [
-            ("style",           wintypes.UINT),
-            ("lpfnWndProc",     WNDPROCTYPE),
-            ("cbClsExtra",      ctypes.c_int),
-            ("cbWndExtra",      ctypes.c_int),
-            ("hInstance",       wintypes.HINSTANCE),
-            ("hIcon",           wintypes.HICON),
-            ("hCursor",         wintypes.HANDLE),
-            ("hbrBackground",   wintypes.HBRUSH),
-            ("lpszMenuName",    wintypes.LPCWSTR),
-            ("lpszClassName",   wintypes.LPCWSTR),
-        ]
+    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
 # ── macOS-only imports ────────────────────────────────────────────────────────
 if IS_MAC:
@@ -112,7 +90,6 @@ if not RTSP_URL:
 
 CACHE_MS      = 1000  # Network/live cache in milliseconds
 RETRY_SEC     = 5     # Seconds to wait before reconnecting on failure
-WIN_HOLD_SEC  = 1.0   # Seconds to hold the Windows button to trigger restart
 UDP_STALL_SEC = 5     # Seconds of frozen playback clock before forcing restart
 
 
@@ -266,15 +243,12 @@ class WindowsViewer:
         self.player   = self.instance.media_player_new()
         self.player.set_fullscreen(True)
 
-        self._running        = True
-        self._restart_lock   = threading.Lock()
-        self._win_pressed_at = None
-        self._win_hold_fired = False
-        self._hook_id_kb     = None
-        self._hook_id_mouse  = None
-        self._hook_proc_kb   = HOOKPROC(self._keyboard_hook)
+        self._running         = True
+        self._restart_lock    = threading.Lock()
+        self._hook_id_kb      = None
+        self._hook_id_mouse   = None
+        self._hook_proc_kb    = HOOKPROC(self._keyboard_hook)
         self._hook_proc_mouse = HOOKPROC(self._mouse_hook)
-        self._hwnd = None
 
         # Prevent display dimming, screensaver and sleep for as long as we run
         ES_CONTINUOUS       = 0x80000000
@@ -359,27 +333,14 @@ class WindowsViewer:
             self._hook_id_mouse, nCode, wParam, lParam
         )
 
-    # ── Keyboard hook: Windows key + Surface hardware button ─────────────
+    # ── Keyboard hook: volume buttons trigger stream restart ──────────────
     def _keyboard_hook(self, nCode, wParam, lParam):
-        if nCode >= 0:
+        if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            vk = kb.vkCode
-            if vk in (VK_LWIN, VK_RWIN):
-                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    now = time.monotonic()
-                    if self._win_pressed_at is None:
-                        self._win_pressed_at = now
-                        self._win_hold_fired = False
-                    elif not self._win_hold_fired:
-                        if now - self._win_pressed_at >= WIN_HOLD_SEC:
-                            self._win_hold_fired = True
-                            threading.Thread(
-                                target=self.restart_stream, daemon=True
-                            ).start()
-                    return 1  # Suppress while held
-                elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                    self._win_pressed_at = None
-                    self._win_hold_fired = False
+            if kb.vkCode in (VK_VOLUME_UP, VK_VOLUME_DOWN):
+                # Suppress the key and restart the stream
+                threading.Thread(target=self.restart_stream, daemon=True).start()
+                return 1
         return ctypes.windll.user32.CallNextHookEx(
             self._hook_id_kb, nCode, wParam, lParam
         )
@@ -389,37 +350,15 @@ class WindowsViewer:
         kernel32 = ctypes.windll.kernel32
         hMod     = kernel32.GetModuleHandleW(None)
 
-        # Low-level keyboard hook (catches VK_LWIN from keyboards)
+        # Low-level keyboard hook — catches volume up/down keys
         self._hook_id_kb = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._hook_proc_kb, hMod, 0
         )
 
-        # Low-level mouse hook (suppresses double-click fullscreen toggle)
+        # Low-level mouse hook — suppresses double-click fullscreen toggle
         self._hook_id_mouse = user32.SetWindowsHookExW(
             WH_MOUSE_LL, self._hook_proc_mouse, hMod, 0
         )
-
-        # ── Hidden window to receive WM_HOTKEY from Surface tablet button ──
-        # The Surface Windows button is registered by the shell as a hotkey
-        # and delivered via WM_HOTKEY — it never reaches the keyboard hook.
-        # We create a message-only window, register the hotkey, and handle it.
-        wc                  = WNDCLASSW()
-        wc.lpfnWndProc      = WNDPROCTYPE(self._wnd_proc)
-        wc.hInstance        = hMod
-        wc.lpszClassName    = "RTSPViewerMsg"
-        user32.RegisterClassW(ctypes.byref(wc))
-
-        HWND_MESSAGE = ctypes.cast(-3, wintypes.HWND)
-        self._hwnd = user32.CreateWindowExW(
-            0, "RTSPViewerMsg", None, 0, 0, 0, 0, 0,
-            HWND_MESSAGE, None, hMod, None
-        )
-
-        # Register all known Surface Windows-button hotkey combinations
-        # MOD_WIN = 0x0008; using MOD_NOREPEAT = 0x4000 to fire once per press
-        MOD_NOREPEAT = 0x4000
-        # Register bare VK=0x5B (no modifier) — Surface sends this via hotkey
-        user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, VK_LWIN)
 
         msg = wintypes.MSG()
         while self._running:
@@ -434,25 +373,6 @@ class WindowsViewer:
             user32.UnhookWindowsHookEx(self._hook_id_kb)
         if self._hook_id_mouse:
             user32.UnhookWindowsHookEx(self._hook_id_mouse)
-        if self._hwnd:
-            user32.UnregisterHotKey(self._hwnd, 1)
-            user32.DestroyWindow(self._hwnd)
-
-    def _wnd_proc(self, hwnd, msg, wParam, lParam):
-        """Handle WM_HOTKEY — fired by Surface hardware Windows button."""
-        if msg == WM_HOTKEY:
-            now = time.monotonic()
-            if self._win_pressed_at is None:
-                self._win_pressed_at = now
-                self._win_hold_fired = False
-            elif not self._win_hold_fired:
-                if now - self._win_pressed_at >= WIN_HOLD_SEC:
-                    self._win_hold_fired = True
-                    threading.Thread(
-                        target=self.restart_stream, daemon=True
-                    ).start()
-            return 0
-        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wParam, lParam)
 
     def shutdown(self):
         self._running = False
