@@ -20,22 +20,12 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    WH_KEYBOARD_LL   = 13
     WH_MOUSE_LL      = 14
-    WM_KEYDOWN       = 0x0100
-    WM_SYSKEYDOWN    = 0x0104
     WM_LBUTTONDBLCLK = 0x0203
-    VK_VOLUME_UP     = 0xAF
-    VK_VOLUME_DOWN   = 0xAE
-
-    class KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("vkCode",      wintypes.DWORD),
-            ("scanCode",    wintypes.DWORD),
-            ("flags",       wintypes.DWORD),
-            ("time",        wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
+    WM_APPCOMMAND    = 0x0319
+    # APPCOMMAND values (high word of lParam >> 4)
+    APPCOMMAND_VOLUME_UP   = 10
+    APPCOMMAND_VOLUME_DOWN = 9
 
     class MSLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -46,7 +36,8 @@ if IS_WINDOWS:
             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
-    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    HOOKPROC    = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 # ── macOS-only imports ────────────────────────────────────────────────────────
 if IS_MAC:
@@ -245,12 +236,10 @@ class WindowsViewer:
 
         self._running         = True
         self._restart_lock    = threading.Lock()
-        self._hook_id_kb      = None
         self._hook_id_mouse   = None
-        self._hook_proc_kb    = HOOKPROC(self._keyboard_hook)
         self._hook_proc_mouse = HOOKPROC(self._mouse_hook)
+        self._wnd_proc_ref    = None  # keep WNDPROCTYPE alive
 
-        # Prevent display dimming, screensaver and sleep for as long as we run
         ES_CONTINUOUS       = 0x80000000
         ES_SYSTEM_REQUIRED  = 0x00000001
         ES_DISPLAY_REQUIRED = 0x00000002
@@ -325,39 +314,65 @@ class WindowsViewer:
                 if self._running:
                     self.restart_stream()
 
-    # ── Mouse hook: suppress double-clicks reaching VLC ───────────────────
+    # ── Mouse hook: suppress double-clicks ───────────────────────────────
     def _mouse_hook(self, nCode, wParam, lParam):
         if nCode >= 0 and wParam == WM_LBUTTONDBLCLK:
-            return 1  # Swallow double-click so VLC can't toggle fullscreen
+            return 1
         return ctypes.windll.user32.CallNextHookEx(
             self._hook_id_mouse, nCode, wParam, lParam
         )
 
-    # ── Keyboard hook: volume buttons trigger stream restart ──────────────
-    def _keyboard_hook(self, nCode, wParam, lParam):
-        if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if kb.vkCode in (VK_VOLUME_UP, VK_VOLUME_DOWN):
-                # Suppress the key and restart the stream
+    # ── Window proc: catches WM_APPCOMMAND (volume buttons) ──────────────
+    def _wnd_proc(self, hwnd, msg, wParam, lParam):
+        if msg == WM_APPCOMMAND:
+            cmd = (lParam >> 16) & 0xFFF
+            if cmd in (APPCOMMAND_VOLUME_UP, APPCOMMAND_VOLUME_DOWN):
                 threading.Thread(target=self.restart_stream, daemon=True).start()
-                return 1
-        return ctypes.windll.user32.CallNextHookEx(
-            self._hook_id_kb, nCode, wParam, lParam
-        )
+                return 1  # Suppress — don't change system volume
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wParam, lParam)
 
     def _run_hooks(self):
         user32   = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         hMod     = kernel32.GetModuleHandleW(None)
 
-        # Low-level keyboard hook — catches volume up/down keys
-        self._hook_id_kb = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._hook_proc_kb, hMod, 0
-        )
-
-        # Low-level mouse hook — suppresses double-click fullscreen toggle
+        # Low-level mouse hook — suppress double-click fullscreen toggle
         self._hook_id_mouse = user32.SetWindowsHookExW(
             WH_MOUSE_LL, self._hook_proc_mouse, hMod, 0
+        )
+
+        # Register a minimal window class to receive WM_APPCOMMAND
+        self._wnd_proc_ref = WNDPROCTYPE(self._wnd_proc)
+
+        class _WNDCLASSEX(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",        wintypes.UINT),
+                ("style",         wintypes.UINT),
+                ("lpfnWndProc",   WNDPROCTYPE),
+                ("cbClsExtra",    ctypes.c_int),
+                ("cbWndExtra",    ctypes.c_int),
+                ("hInstance",     wintypes.HANDLE),
+                ("hIcon",         wintypes.HANDLE),
+                ("hCursor",       wintypes.HANDLE),
+                ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName",  ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p),
+                ("hIconSm",       wintypes.HANDLE),
+            ]
+
+        wc              = _WNDCLASSEX()
+        wc.cbSize       = ctypes.sizeof(_WNDCLASSEX)
+        wc.lpfnWndProc  = self._wnd_proc_ref
+        wc.hInstance    = hMod
+        wc.lpszClassName = "RTSPAppCmd"
+        user32.RegisterClassExW(ctypes.byref(wc))
+
+        # HWND_MESSAGE (-3) = message-only window, invisible, no taskbar entry
+        HWND_MESSAGE = ctypes.cast(-3, wintypes.HWND)
+        hwnd = user32.CreateWindowExW(
+            0, "RTSPAppCmd", None, 0,
+            0, 0, 0, 0,
+            HWND_MESSAGE, None, hMod, None
         )
 
         msg = wintypes.MSG()
@@ -369,15 +384,14 @@ class WindowsViewer:
             else:
                 time.sleep(0.01)
 
-        if self._hook_id_kb:
-            user32.UnhookWindowsHookEx(self._hook_id_kb)
         if self._hook_id_mouse:
             user32.UnhookWindowsHookEx(self._hook_id_mouse)
+        if hwnd:
+            user32.DestroyWindow(hwnd)
 
     def shutdown(self):
         self._running = False
-        # Restore normal power management
-        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
         try:
             self.player.stop()
         except Exception:
