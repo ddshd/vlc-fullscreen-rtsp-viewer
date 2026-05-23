@@ -20,11 +20,20 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    WH_KEYBOARD_LL = 13
-    WM_KEYDOWN     = 0x0100
-    WM_SYSKEYDOWN  = 0x0104
-    VK_LWIN        = 0x5B
-    VK_RWIN        = 0x5C
+    WH_KEYBOARD_LL  = 13
+    WH_MOUSE_LL     = 14
+    WM_KEYDOWN      = 0x0100
+    WM_SYSKEYDOWN   = 0x0104
+    WM_KEYUP        = 0x0101
+    WM_SYSKEYUP     = 0x0105
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_HOTKEY       = 0x0312
+    VK_LWIN         = 0x5B
+    VK_RWIN         = 0x5C
+
+    # Surface tablet Windows button comes through as a registered hotkey
+    # with these IDs from the tablet input service
+    SURFACE_WIN_HOTKEY_ID = 0x0001
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -35,9 +44,17 @@ if IS_WINDOWS:
             ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
         ]
 
-    HOOKPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
-    )
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("pt",          wintypes.POINT),
+            ("mouseData",   wintypes.DWORD),
+            ("flags",       wintypes.DWORD),
+            ("time",        wintypes.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    HOOKPROC      = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    WNDPROCTYPE   = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 # ── macOS-only imports ────────────────────────────────────────────────────────
 if IS_MAC:
@@ -78,11 +95,11 @@ if not RTSP_URL:
     print("ERROR: RTSP_URL environment variable is not set.", file=sys.stderr)
     print("Example: export RTSP_URL=rtsp://user:pass@192.168.1.1:554/stream", file=sys.stderr)
     sys.exit(1)
-CACHE_MS     = 1000  # Network/live cache in milliseconds
-RETRY_SEC    = 5     # Seconds to wait before reconnecting on failure
-WIN_HOLD_SEC = 1.0   # Seconds to hold the Windows button to trigger restart
-# UDP: if no video frame arrives within this many seconds, force a restart
-UDP_STALL_SEC = 5
+
+CACHE_MS      = 1000  # Network/live cache in milliseconds
+RETRY_SEC     = 5     # Seconds to wait before reconnecting on failure
+WIN_HOLD_SEC  = 1.0   # Seconds to hold the Windows button to trigger restart
+UDP_STALL_SEC = 5     # Seconds of frozen playback clock before forcing restart
 
 
 # ── macOS Cocoa app ───────────────────────────────────────────────────────────
@@ -93,11 +110,34 @@ def run_mac():
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
 
-    # Full screen rect from main display
+    # Prevent display sleep and screensaver on macOS
+    try:
+        import ctypes as _ctypes
+        _iokit = _ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/IOKit.framework/IOKit"
+        )
+        _iokit.IOPMAssertionCreateWithName.restype  = _ctypes.c_uint32
+        _iokit.IOPMAssertionCreateWithName.argtypes = [
+            _ctypes.c_void_p, _ctypes.c_uint32, _ctypes.c_void_p, _ctypes.POINTER(_ctypes.c_uint32)
+        ]
+        from CoreFoundation import CFStringCreateWithCString, kCFStringEncodingUTF8
+        _assertion_name = CFStringCreateWithCString(
+            None, b"RTSPViewer preventing sleep", kCFStringEncodingUTF8
+        )
+        _assertion_type = CFStringCreateWithCString(
+            None, b"PreventUserIdleDisplaySleep", kCFStringEncodingUTF8
+        )
+        _assertion_id   = _ctypes.c_uint32(0)
+        _iokit.IOPMAssertionCreateWithName(
+            _assertion_type, 255, _assertion_name,
+            _ctypes.byref(_assertion_id)
+        )
+    except Exception:
+        pass  # Non-fatal — viewer still works without this
+
     screen      = NSScreen.mainScreen()
     screen_rect = screen.frame()
 
-    # Borderless black window covering the whole screen
     window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
         screen_rect,
         NSWindowStyleMaskBorderless,
@@ -105,14 +145,12 @@ def run_mac():
         False,
     )
     window.setBackgroundColor_(NSColor.blackColor())
-    window.setLevel_(25)          # Above everything (kCGMaximumWindowLevel-ish)
+    window.setLevel_(25)
     window.makeKeyAndOrderFront_(None)
     app.activateIgnoringOtherApps_(True)
 
-    # The content view is what we hand to VLC
     content_view = window.contentView()
 
-    # ── VLC ───────────────────────────────────────────────────────────────
     vlc_args = [
         "--no-audio",
         "--network-caching={}".format(CACHE_MS),
@@ -121,7 +159,8 @@ def run_mac():
         "--quiet",
         "--vout=macosx",
         "--codec=avcodec,any",
-        "--avcodec-hw=any",          # VideoToolbox on macOS
+        "--avcodec-hw=any",
+        "--no-mouse-events",         # Disable double-tap/click fullscreen toggle
     ]
     instance = vlc.Instance(*vlc_args)
     player   = instance.media_player_new()
@@ -214,21 +253,33 @@ class WindowsViewer:
             "--quiet",
             "--video-on-top",
             "--codec=avcodec,any",
-            "--avcodec-hw=dxva2",    # DirectX Video Acceleration on Windows
+            "--avcodec-hw=dxva2",
+            "--no-mouse-events",         # Disable double-click fullscreen toggle
         ]
         self.instance = vlc.Instance(*vlc_args)
         self.player   = self.instance.media_player_new()
         self.player.set_fullscreen(True)
 
-        self._running      = True
-        self._restart_lock = threading.Lock()
+        self._running        = True
+        self._restart_lock   = threading.Lock()
         self._win_pressed_at = None
         self._win_hold_fired = False
-        self._hook_id        = None
-        self._hook_proc      = HOOKPROC(self._keyboard_hook)
+        self._hook_id_kb     = None
+        self._hook_id_mouse  = None
+        self._hook_proc_kb   = HOOKPROC(self._keyboard_hook)
+        self._hook_proc_mouse = HOOKPROC(self._mouse_hook)
+        self._hwnd = None
+
+        # Prevent display dimming, screensaver and sleep for as long as we run
+        ES_CONTINUOUS       = 0x80000000
+        ES_SYSTEM_REQUIRED  = 0x00000001
+        ES_DISPLAY_REQUIRED = 0x00000002
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        )
 
         threading.Thread(target=self._watch_loop, daemon=True).start()
-        threading.Thread(target=self._run_hook,   daemon=True).start()
+        threading.Thread(target=self._run_hooks,  daemon=True).start()
 
         time.sleep(1.0)
         self._start_stream()
@@ -294,6 +345,15 @@ class WindowsViewer:
                 if self._running:
                     self.restart_stream()
 
+    # ── Mouse hook: suppress double-clicks reaching VLC ───────────────────
+    def _mouse_hook(self, nCode, wParam, lParam):
+        if nCode >= 0 and wParam == WM_LBUTTONDBLCLK:
+            return 1  # Swallow double-click so VLC can't toggle fullscreen
+        return ctypes.windll.user32.CallNextHookEx(
+            self._hook_id_mouse, nCode, wParam, lParam
+        )
+
+    # ── Keyboard hook: Windows key + Surface hardware button ─────────────
     def _keyboard_hook(self, nCode, wParam, lParam):
         if nCode >= 0:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
@@ -310,23 +370,51 @@ class WindowsViewer:
                             threading.Thread(
                                 target=self.restart_stream, daemon=True
                             ).start()
-                    return 1
-                else:
+                    return 1  # Suppress while held
+                elif wParam in (WM_KEYUP, WM_SYSKEYUP):
                     self._win_pressed_at = None
                     self._win_hold_fired = False
         return ctypes.windll.user32.CallNextHookEx(
-            self._hook_id, nCode, wParam, lParam
+            self._hook_id_kb, nCode, wParam, lParam
         )
 
-    def _run_hook(self):
+    def _run_hooks(self):
         user32   = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         hMod     = kernel32.GetModuleHandleW(None)
-        self._hook_id = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._hook_proc, hMod, 0
+
+        # Low-level keyboard hook (catches VK_LWIN from keyboards)
+        self._hook_id_kb = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc_kb, hMod, 0
         )
-        if not self._hook_id:
-            return
+
+        # Low-level mouse hook (suppresses double-click fullscreen toggle)
+        self._hook_id_mouse = user32.SetWindowsHookExW(
+            WH_MOUSE_LL, self._hook_proc_mouse, hMod, 0
+        )
+
+        # ── Hidden window to receive WM_HOTKEY from Surface tablet button ──
+        # The Surface Windows button is registered by the shell as a hotkey
+        # and delivered via WM_HOTKEY — it never reaches the keyboard hook.
+        # We create a message-only window, register the hotkey, and handle it.
+        wc                  = ctypes.wintypes.WNDCLASSW()
+        wc.lpfnWndProc      = WNDPROCTYPE(self._wnd_proc)
+        wc.hInstance        = hMod
+        wc.lpszClassName    = "RTSPViewerMsg"
+        user32.RegisterClassW(ctypes.byref(wc))
+
+        HWND_MESSAGE = ctypes.cast(-3, wintypes.HWND)
+        self._hwnd = user32.CreateWindowExW(
+            0, "RTSPViewerMsg", None, 0, 0, 0, 0, 0,
+            HWND_MESSAGE, None, hMod, None
+        )
+
+        # Register all known Surface Windows-button hotkey combinations
+        # MOD_WIN = 0x0008; using MOD_NOREPEAT = 0x4000 to fire once per press
+        MOD_NOREPEAT = 0x4000
+        # Register bare VK=0x5B (no modifier) — Surface sends this via hotkey
+        user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, VK_LWIN)
+
         msg = wintypes.MSG()
         while self._running:
             ret = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)
@@ -335,10 +423,35 @@ class WindowsViewer:
                 user32.DispatchMessageW(ctypes.byref(msg))
             else:
                 time.sleep(0.01)
-        user32.UnhookWindowsHookEx(self._hook_id)
+
+        if self._hook_id_kb:
+            user32.UnhookWindowsHookEx(self._hook_id_kb)
+        if self._hook_id_mouse:
+            user32.UnhookWindowsHookEx(self._hook_id_mouse)
+        if self._hwnd:
+            user32.UnregisterHotKey(self._hwnd, 1)
+            user32.DestroyWindow(self._hwnd)
+
+    def _wnd_proc(self, hwnd, msg, wParam, lParam):
+        """Handle WM_HOTKEY — fired by Surface hardware Windows button."""
+        if msg == WM_HOTKEY:
+            now = time.monotonic()
+            if self._win_pressed_at is None:
+                self._win_pressed_at = now
+                self._win_hold_fired = False
+            elif not self._win_hold_fired:
+                if now - self._win_pressed_at >= WIN_HOLD_SEC:
+                    self._win_hold_fired = True
+                    threading.Thread(
+                        target=self.restart_stream, daemon=True
+                    ).start()
+            return 0
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wParam, lParam)
 
     def shutdown(self):
         self._running = False
+        # Restore normal power management
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS
         try:
             self.player.stop()
         except Exception:
@@ -358,7 +471,8 @@ class LinuxViewer:
             "--video-on-top",
             "--fullscreen",
             "--codec=avcodec,any",
-            "--avcodec-hw=vaapi",    # VA-API on Linux
+            "--avcodec-hw=vaapi",
+            "--no-mouse-events",         # Disable double-click fullscreen toggle
         ]
         self.instance = vlc.Instance(*vlc_args)
         self.player   = self.instance.media_player_new()
@@ -366,6 +480,22 @@ class LinuxViewer:
 
         self._running      = True
         self._restart_lock = threading.Lock()
+
+        # Prevent display sleep on Linux — try common inhibitors
+        self._inhibit_proc = None
+        try:
+            import subprocess
+            # systemd-inhibit keeps sleep/idle blocked for our lifetime
+            self._inhibit_proc = subprocess.Popen([
+                "systemd-inhibit",
+                "--what=idle:sleep:handle-lid-switch",
+                "--who=RTSPViewer",
+                "--why=Displaying RTSP stream",
+                "--mode=block",
+                "sleep", "infinity"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass  # Non-fatal
 
         threading.Thread(target=self._watch_loop, daemon=True).start()
 
@@ -375,7 +505,11 @@ class LinuxViewer:
             while self._running:
                 time.sleep(0.5)
         except KeyboardInterrupt:
+            pass
+        finally:
             self.player.stop()
+            if self._inhibit_proc:
+                self._inhibit_proc.terminate()
 
     def _start_stream(self):
         try:

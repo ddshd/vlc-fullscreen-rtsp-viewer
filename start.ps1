@@ -39,8 +39,8 @@ Download-WithFallback -Url $ScriptUrl  -Destination $ScriptPath -Label "viewer.p
 
 # ── Install dependencies ──────────────────────────────────────────────────────
 Write-Host "Installing required packages..."
-pip install -r $ReqsPath --quiet
+pip install -r $ReqsPath
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 Write-Host "Launching viewer..."
-Start-Process pythonw -ArgumentList "`"$ScriptPath`""
+Start-Process python.exe "`"$ScriptPath`""
