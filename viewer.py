@@ -37,7 +37,7 @@ if IS_WINDOWS:
         ]
 
     HOOKPROC    = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-    WNDPROCTYPE = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 # ── macOS-only imports ────────────────────────────────────────────────────────
 if IS_MAC:
@@ -228,7 +228,7 @@ class WindowsViewer:
             "--video-on-top",
             "--codec=avcodec,any",
             "--avcodec-hw=dxva2",
-            "--no-mouse-events",         # Disable double-click fullscreen toggle
+            "--no-mouse-events",
         ]
         self.instance = vlc.Instance(*vlc_args)
         self.player   = self.instance.media_player_new()
@@ -329,7 +329,9 @@ class WindowsViewer:
             if cmd in (APPCOMMAND_VOLUME_UP, APPCOMMAND_VOLUME_DOWN):
                 threading.Thread(target=self.restart_stream, daemon=True).start()
                 return 1  # Suppress — don't change system volume
-        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+        return ctypes.windll.user32.DefWindowProcW(
+            hwnd, msg, wParam, ctypes.c_long(lParam)
+        )
 
     def _run_hooks(self):
         user32   = ctypes.windll.user32
