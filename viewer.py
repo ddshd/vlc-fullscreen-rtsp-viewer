@@ -20,23 +20,11 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    WH_MOUSE_LL      = 14
-    WM_LBUTTONDBLCLK = 0x0203
-    WM_APPCOMMAND    = 0x0319
-    # APPCOMMAND values (high word of lParam >> 4)
+    WM_LBUTTONDBLCLK       = 0x0203
+    WM_APPCOMMAND          = 0x0319
     APPCOMMAND_VOLUME_UP   = 10
     APPCOMMAND_VOLUME_DOWN = 9
 
-    class MSLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("pt",          wintypes.POINT),
-            ("mouseData",   wintypes.DWORD),
-            ("flags",       wintypes.DWORD),
-            ("time",        wintypes.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
-    HOOKPROC    = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
     WNDPROCTYPE = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
 # ── macOS-only imports ────────────────────────────────────────────────────────
@@ -234,11 +222,11 @@ class WindowsViewer:
         self.player   = self.instance.media_player_new()
         self.player.set_fullscreen(True)
 
-        self._running         = True
-        self._restart_lock    = threading.Lock()
-        self._hook_id_mouse   = None
-        self._hook_proc_mouse = HOOKPROC(self._mouse_hook)
-        self._wnd_proc_ref    = None  # keep WNDPROCTYPE alive
+        self._running          = True
+        self._restart_lock     = threading.Lock()
+        self._wnd_proc_ref     = None   # keep WNDPROCTYPE ref alive
+        self._orig_wnd_proc    = None   # original VLC WndProc (for CallWindowProc)
+        self._vlc_hwnd         = None
 
         ES_CONTINUOUS       = 0x80000000
         ES_SYSTEM_REQUIRED  = 0x00000001
@@ -248,11 +236,16 @@ class WindowsViewer:
         )
 
         threading.Thread(target=self._watch_loop, daemon=True).start()
-        threading.Thread(target=self._run_hooks,  daemon=True).start()
 
         time.sleep(1.0)
         self._start_stream()
+
+        # Subclass VLC's window once it exists so we intercept its messages
+        self._subclass_vlc_window()
+
         self._main_loop()
+
+    # ── Stream control ────────────────────────────────────────────────────
 
     def _start_stream(self):
         try:
@@ -268,6 +261,9 @@ class WindowsViewer:
         self.player.play()
         time.sleep(1.5)
         self.player.set_fullscreen(True)
+        # Re-subclass after each restart since VLC recreates its window
+        if self._vlc_hwnd:
+            self._subclass_vlc_window()
 
     def restart_stream(self):
         if not self._restart_lock.acquire(blocking=False):
@@ -277,6 +273,80 @@ class WindowsViewer:
             time.sleep(8)
         finally:
             self._restart_lock.release()
+
+    # ── Find and subclass VLC's window ────────────────────────────────────
+
+    def _find_vlc_hwnd(self):
+        """Find VLC's top-level video window by enumerating windows."""
+        user32    = ctypes.windll.user32
+        found     = ctypes.c_ulong(0)
+        pid       = ctypes.windll.kernel32.GetCurrentProcessId()
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _enum(hwnd, _):
+            wp = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wp))
+            if wp.value == pid:
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, buf, 256)
+                # VLC's DirectX video window class name
+                if buf.value in ("DirectDrawDeviceWnd", "VLC DirectX", "VLC video output"):
+                    found.value = hwnd
+                    return False  # stop enumeration
+            return True
+
+        cb = WNDENUMPROC(_enum)
+        user32.EnumWindows(cb, 0)
+        return wintypes.HWND(found.value) if found.value else None
+
+    def _subclass_vlc_window(self):
+        """Replace VLC's WndProc with ours so we intercept WM_APPCOMMAND etc."""
+        user32 = ctypes.windll.user32
+
+        # Wait up to 5 s for VLC to create its window
+        for _ in range(50):
+            hwnd = self._find_vlc_hwnd()
+            if hwnd:
+                break
+            time.sleep(0.1)
+        else:
+            return  # Couldn't find it — non-fatal
+
+        self._vlc_hwnd      = hwnd
+        self._wnd_proc_ref  = WNDPROCTYPE(self._vlc_wnd_proc)
+
+        # SetWindowLongPtrW(GWLP_WNDPROC = -4) replaces the window proc
+        GWLP_WNDPROC = -4
+        user32.SetWindowLongPtrW.restype  = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        orig = user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._wnd_proc_ref)
+        self._orig_wnd_proc = ctypes.c_void_p(orig)
+
+    # ── Subclassed window proc ────────────────────────────────────────────
+
+    def _vlc_wnd_proc(self, hwnd, msg, wParam, lParam):
+        user32 = ctypes.windll.user32
+
+        # Volume buttons → restart stream
+        if msg == WM_APPCOMMAND:
+            cmd = (lParam >> 16) & 0xFFF
+            if cmd in (APPCOMMAND_VOLUME_UP, APPCOMMAND_VOLUME_DOWN):
+                threading.Thread(target=self.restart_stream, daemon=True).start()
+                return 1  # Suppress — don't change system volume
+
+        # Double-click → suppress (don't let VLC toggle fullscreen)
+        if msg == WM_LBUTTONDBLCLK:
+            return 0
+
+        # All other messages → pass to original VLC proc
+        if self._orig_wnd_proc:
+            return user32.CallWindowProcW(
+                self._orig_wnd_proc, hwnd, msg, wParam, ctypes.c_long(lParam)
+            )
+        return user32.DefWindowProcW(hwnd, msg, wParam, ctypes.c_long(lParam))
+
+    # ── Loops ─────────────────────────────────────────────────────────────
 
     def _main_loop(self):
         try:
@@ -313,83 +383,6 @@ class WindowsViewer:
                 last_check = now
                 if self._running:
                     self.restart_stream()
-
-    # ── Mouse hook: suppress double-clicks ───────────────────────────────
-    def _mouse_hook(self, nCode, wParam, lParam):
-        if nCode >= 0 and wParam == WM_LBUTTONDBLCLK:
-            return 1
-        return ctypes.windll.user32.CallNextHookEx(
-            self._hook_id_mouse, nCode, wParam, lParam
-        )
-
-    # ── Window proc: catches WM_APPCOMMAND (volume buttons) ──────────────
-    def _wnd_proc(self, hwnd, msg, wParam, lParam):
-        if msg == WM_APPCOMMAND:
-            cmd = (lParam >> 16) & 0xFFF
-            if cmd in (APPCOMMAND_VOLUME_UP, APPCOMMAND_VOLUME_DOWN):
-                threading.Thread(target=self.restart_stream, daemon=True).start()
-                return 1  # Suppress — don't change system volume
-        return ctypes.windll.user32.DefWindowProcW(
-            hwnd, msg, wParam, ctypes.c_long(lParam)
-        )
-
-    def _run_hooks(self):
-        user32   = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        hMod     = kernel32.GetModuleHandleW(None)
-
-        # Low-level mouse hook — suppress double-click fullscreen toggle
-        self._hook_id_mouse = user32.SetWindowsHookExW(
-            WH_MOUSE_LL, self._hook_proc_mouse, hMod, 0
-        )
-
-        # Register a minimal window class to receive WM_APPCOMMAND
-        self._wnd_proc_ref = WNDPROCTYPE(self._wnd_proc)
-
-        class _WNDCLASSEX(ctypes.Structure):
-            _fields_ = [
-                ("cbSize",        wintypes.UINT),
-                ("style",         wintypes.UINT),
-                ("lpfnWndProc",   WNDPROCTYPE),
-                ("cbClsExtra",    ctypes.c_int),
-                ("cbWndExtra",    ctypes.c_int),
-                ("hInstance",     wintypes.HANDLE),
-                ("hIcon",         wintypes.HANDLE),
-                ("hCursor",       wintypes.HANDLE),
-                ("hbrBackground", wintypes.HANDLE),
-                ("lpszMenuName",  ctypes.c_wchar_p),
-                ("lpszClassName", ctypes.c_wchar_p),
-                ("hIconSm",       wintypes.HANDLE),
-            ]
-
-        wc              = _WNDCLASSEX()
-        wc.cbSize       = ctypes.sizeof(_WNDCLASSEX)
-        wc.lpfnWndProc  = self._wnd_proc_ref
-        wc.hInstance    = hMod
-        wc.lpszClassName = "RTSPAppCmd"
-        user32.RegisterClassExW(ctypes.byref(wc))
-
-        # HWND_MESSAGE (-3) = message-only window, invisible, no taskbar entry
-        HWND_MESSAGE = ctypes.cast(-3, wintypes.HWND)
-        hwnd = user32.CreateWindowExW(
-            0, "RTSPAppCmd", None, 0,
-            0, 0, 0, 0,
-            HWND_MESSAGE, None, hMod, None
-        )
-
-        msg = wintypes.MSG()
-        while self._running:
-            ret = user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1)
-            if ret:
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-            else:
-                time.sleep(0.01)
-
-        if self._hook_id_mouse:
-            user32.UnhookWindowsHookEx(self._hook_id_mouse)
-        if hwnd:
-            user32.DestroyWindow(hwnd)
 
     def shutdown(self):
         self._running = False
