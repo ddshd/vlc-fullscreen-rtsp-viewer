@@ -65,12 +65,112 @@ RETRY_SEC         = 5      # Seconds to wait before reconnecting on failure
 UDP_STALL_SEC     = 5      # Seconds of frozen playback clock before forcing restart
 HOURLY_RESTART_S  = 3600   # Scheduled restart interval in seconds
 
+VLC_BRIGHTNESS    = 1.2    # VLC video brightness (1.0 = normal, 1.2 = +20%)
+BRIGHT_DAY        = 1.0    # Display brightness 05:00–00:00  (100%)
+BRIGHT_NIGHT      = 0.7    # Display brightness 00:00–05:00  (70%)
+NIGHT_START_H     = 0      # Hour night-dim begins (0 = midnight)
+NIGHT_END_H       = 5      # Hour night-dim ends   (5 = 5am)
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+# ── Display brightness ────────────────────────────────────────────────────────
+
+def _target_brightness():
+    """Return the brightness level that should be active right now."""
+    h = datetime.datetime.now().hour
+    if NIGHT_START_H <= h < NIGHT_END_H:
+        return BRIGHT_NIGHT
+    return BRIGHT_DAY
+
+
+def _set_display_brightness_windows(level):
+    """Set display brightness on Windows via WMI (0–100)."""
+    try:
+        import subprocess
+        pct = int(level * 100)
+        subprocess.run(
+            ["powershell", "-Command",
+             f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+             f".WmiSetBrightness(1,{pct})"],
+            capture_output=True
+        )
+    except Exception as e:
+        log(f"[BRIGHTNESS] Windows set failed: {e}")
+
+
+def _set_display_brightness_mac(level):
+    """Set display brightness on macOS via IOKit DisplayServices."""
+    try:
+        import ctypes
+        ds = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/IOKit.framework/IOKit"
+        )
+        # IODisplaySetFloatParameter for brightness
+        # Simpler: use osascript
+        import subprocess
+        pct = int(level * 100)
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "System Events" to set brightness of display 1 to {level}'],
+            capture_output=True
+        )
+    except Exception as e:
+        log(f"[BRIGHTNESS] macOS set failed: {e}")
+
+
+def _set_display_brightness_linux(level):
+    """Set display brightness on Linux via xrandr or brightnessctl."""
+    try:
+        import subprocess
+        # Try brightnessctl first (works on most modern setups)
+        result = subprocess.run(
+            ["brightnessctl", "set", f"{int(level * 100)}%"],
+            capture_output=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError("brightnessctl failed")
+    except Exception:
+        try:
+            import subprocess
+            subprocess.run(
+                ["xrandr", "--output", "LVDS-1", "--brightness", str(level)],
+                capture_output=True
+            )
+        except Exception as e:
+            log(f"[BRIGHTNESS] Linux set failed: {e}")
+
+
+def set_display_brightness(level):
+    if IS_WINDOWS:
+        _set_display_brightness_windows(level)
+    elif IS_MAC:
+        _set_display_brightness_mac(level)
+    else:
+        _set_display_brightness_linux(level)
+
+
+class BrightnessManager:
+    """Checks every minute whether the display brightness needs to change."""
+
+    def __init__(self):
+        self._current = None
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            target = _target_brightness()
+            if target != self._current:
+                label = "DAY (100%)" if target == BRIGHT_DAY else "NIGHT (70%)"
+                log(f"[BRIGHTNESS] Setting display brightness → {label}")
+                set_display_brightness(target)
+                self._current = target
+            time.sleep(60)
 
 
 # ── Shared stream logic ───────────────────────────────────────────────────────
@@ -121,7 +221,11 @@ class StreamManager:
         self.player.set_media(media)
         self.player.play()
         self._start_time = time.monotonic()
-        log(f"  → Player started (state: {self.player.get_state()})")
+        # Apply brightness boost to VLC video output
+        self.player.video_set_adjust_int(vlc.VideoAdjust.Enable, 1)
+        self.player.video_set_adjust_float(vlc.VideoAdjust.Brightness, VLC_BRIGHTNESS)
+        log(f"  → Player started (state: {self.player.get_state()}, "
+            f"VLC brightness: {VLC_BRIGHTNESS})")
 
     def restart(self, reason):
         """Thread-safe restart. Skips if one is already in progress."""
@@ -257,6 +361,7 @@ def run_mac():
     player.set_nsobject(objc.pyobjc_id(content_view))
 
     mgr = StreamManager(instance, player)
+    BrightnessManager()
     mgr.start(reason="startup")
 
     from AppKit import NSDate, NSRunLoop, NSDefaultRunLoopMode
@@ -301,7 +406,10 @@ class WindowsViewer:
         )
         log("[STARTUP] Display sleep prevention active (SetThreadExecutionState)")
 
+        self._boost_brightness()
+
         self.mgr = StreamManager(self.instance, self.player)
+        BrightnessManager()
 
         time.sleep(1.0)
         self.mgr.start(reason="startup")
@@ -315,6 +423,29 @@ class WindowsViewer:
             log("[SHUTDOWN] Interrupted by user")
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
             self.mgr.stop()
+
+    def _boost_brightness(self):
+        """Read current brightness via WMI and set it to current + 20%, capped at 100."""
+        try:
+            import subprocess
+            # Read current brightness
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness"],
+                capture_output=True, text=True, timeout=5
+            )
+            current = int(result.stdout.strip())
+            target  = min(100, current + 20)
+            # Set new brightness
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods)"
+                 f".WmiSetBrightness(1,{target})"],
+                capture_output=True, timeout=5
+            )
+            log(f"[STARTUP] Brightness: {current}% → {target}% (+20%)")
+        except Exception as e:
+            log(f"[STARTUP] Could not adjust brightness: {e}")
 
 
 # ── Linux runner ──────────────────────────────────────────────────────────────
@@ -355,6 +486,7 @@ class LinuxViewer:
             log(f"[STARTUP] Could not prevent display sleep: {e}")
 
         self.mgr = StreamManager(self.instance, self.player)
+        BrightnessManager()
 
         time.sleep(0.5)
         self.mgr.start(reason="startup")
