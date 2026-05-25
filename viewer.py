@@ -222,8 +222,9 @@ class StreamManager:
         self.player.play()
         self._start_time = time.monotonic()
         # Apply brightness boost to VLC video output
-        self.player.video_set_adjust_int(vlc.VideoAdjust.Enable, 1)
-        self.player.video_set_adjust_float(vlc.VideoAdjust.Brightness, VLC_BRIGHTNESS)
+        # VideoAdjust constants: Enable=0, Contrast=1, Brightness=2, Hue=3, Saturation=4, Gamma=5
+        self.player.video_set_adjust_int(0, 1)      # Enable=0, value=1 (on)
+        self.player.video_set_adjust_float(2, VLC_BRIGHTNESS)  # Brightness=2
         log(f"  → Player started (state: {self.player.get_state()}, "
             f"VLC brightness: {VLC_BRIGHTNESS})")
 
