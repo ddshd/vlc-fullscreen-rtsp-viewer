@@ -25,7 +25,8 @@ Environment=XDG_SESSION_TYPE=wayland
 # The camera URL (with credentials) lives here, NOT in git:
 EnvironmentFile=/etc/camera-stream.env
 ExecStart=/usr/bin/cage -- /usr/bin/mpv \
-  --no-audio --rtsp-transport=tcp --profile=low-latency --hwdec=no \
+  --no-audio --rtsp-transport=udp --profile=low-latency --hwdec=no \
+  --demuxer-lavf-o=fflags=nobuffer \
   --vo=gpu --fullscreen --no-osc --cursor-autohide=always \
   --no-input-default-bindings --really-quiet \
   --demuxer-lavf-o=timeout=5000000 \
