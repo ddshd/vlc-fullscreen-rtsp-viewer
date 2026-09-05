@@ -30,8 +30,10 @@ apt install -y mpv cage fonts-dejavu socat triggerhappy evtest
 echo "==> Installing files"
 install -D -m 0644 "$HERE/systemd/camera-stream.service"   /etc/systemd/system/camera-stream.service
 install -D -m 0644 "$HERE/systemd/camera-watchdog.service" /etc/systemd/system/camera-watchdog.service
+install -D -m 0644 "$HERE/systemd/net-watchdog.service"  /etc/systemd/system/net-watchdog.service
 install -D -m 0644 "$HERE/pam/cage"                        /etc/pam.d/cage
 install -D -m 0755 "$HERE/scripts/camera-watchdog.sh"      /usr/local/bin/camera-watchdog.sh
+install -D -m 0755 "$HERE/scripts/net-watchdog.sh"    /usr/local/bin/net-watchdog.sh
 install -D -m 0644 "$HERE/scripts/refresh-button.lua"      /usr/local/share/mpv-refresh/refresh-button.lua
 install -D -m 0644 "$HERE/triggerhappy/refresh.conf"       /etc/triggerhappy/triggers.d/refresh.conf
 
@@ -68,7 +70,7 @@ systemctl disable --now getty@tty1.service 2>/dev/null || true
 
 echo "==> Enabling services"
 systemctl daemon-reload
-systemctl enable camera-stream.service camera-watchdog.service
+systemctl enable camera-stream.service camera-watchdog.service net-watchdog.service
 systemctl restart triggerhappy.service 2>/dev/null || true
 
 cat <<EOF

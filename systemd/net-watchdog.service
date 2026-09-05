@@ -1,0 +1,13 @@
+[Unit]
+Description=Reboot if the network gateway becomes unreachable
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/net-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
