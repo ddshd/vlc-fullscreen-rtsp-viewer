@@ -1,0 +1,40 @@
+name: Build release zip
+
+# Builds surface3-camera-kiosk.zip. Runs on demand, and on a version tag it
+# also publishes the zip as a downloadable GitHub Release asset.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Build the zip
+        # git archive only includes committed, non-export-ignored files, so a
+        # local /etc/camera-stream.env (git-ignored) can never leak into it.
+        run: |
+          git archive --format=zip \
+            --prefix=surface3-camera-kiosk/ \
+            -o surface3-camera-kiosk.zip HEAD
+          unzip -l surface3-camera-kiosk.zip
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: surface3-camera-kiosk
+          path: surface3-camera-kiosk.zip
+
+      - name: Attach to the GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: surface3-camera-kiosk.zip

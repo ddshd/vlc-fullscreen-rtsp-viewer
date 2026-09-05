@@ -1,0 +1,13 @@
+[Unit]
+Description=Watchdog - restart camera stream if the picture freezes
+After=camera-stream.service
+Requires=camera-stream.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camera-watchdog.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# Never commit the real camera URL / credentials
+camera-stream.env
+/etc/camera-stream.env
+
+# Build output
+*.zip
